@@ -1,13 +1,91 @@
 from datetime import datetime, timezone
-from fastapi import Depends, FastAPI, HTTPException, Response
+from time import time
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, query
 from src.database import Base, engine, get_db
 from src.models import Node
 from src.schemas import NodeCreate, NodeResponse, NodeUpdate
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, Gauge, generate_latest
+
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI()
+
+request_counter = Counter(
+    "http_requests_total", 
+    "Total counter of http requests",
+    ['method', 'endpoint', 'status_code'],
+)
+
+request_duration = Histogram(
+    "http_request_duration",
+    "Latency of http requests",
+    ['method', 'endpoint', 'status_code'],
+)
+
+active_nodes = Gauge(
+    "active_nodes",
+    "Number of active nodes",
+)
+
+@app.middleware("http")
+async def metrics_mw(request: Request, call_next):
+    start = time()
+    response = None
+
+    try:
+        response = await call_next(request)
+        return response
+
+    finally: 
+        duration = time() - start
+
+        route = request.scope.get("route")
+        endpoint = (
+                route.path
+                if route
+                else request.url.path
+            )
+
+        excluded = {
+            "/metrics",
+            "/docs",
+            "/openapi.json",
+            "/redoc",
+        }
+
+        if endpoint not in excluded:
+            status = (
+                response.status_code
+                if response
+                else 500
+            )
+
+            request_counter.labels(
+                method=request.method,
+                endpoint=endpoint,
+                status_code=status
+            ).inc()
+
+            request_duration.labels(
+                method=request.method,
+                endpoint=endpoint,
+                status_code=status
+            ).observe(duration)
+
+
+@app.get("/metrics")
+def get_metrics(db: Session = Depends(get_db)):
+    try:
+        count = db.query(Node).filter(Node.status == "active").count()
+        active_nodes.set(count)
+    except Exception:
+        pass
+
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
